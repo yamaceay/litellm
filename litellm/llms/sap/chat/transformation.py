@@ -2,22 +2,22 @@
 Translate from OpenAI's `/v1/chat/completions` to SAP Generative AI Hub's Orchestration Service`v2/completion`
 """
 
+from functools import cached_property
 from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    FrozenSet,
+    Iterator,
     List,
     Optional,
-    Union,
-    Dict,
     Tuple,
-    Any,
     TYPE_CHECKING,
-    Iterator,
-    AsyncIterator,
-    FrozenSet,
+    Union,
 )
-from functools import cached_property
-import litellm
-import httpx
 
+import httpx
+import litellm
 
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import ModelResponse
@@ -32,6 +32,11 @@ else:
     LiteLLMLoggingObj = Any
 
 from ..credentials import get_token_creator
+from .handler import (
+    AsyncSAPStreamIterator,
+    GenAIHubOrchestrationError,
+    SAPStreamIterator,
+)
 from .models import (
     ChatCompletionTool,
     OrchestrationRequest,
@@ -42,11 +47,47 @@ from .models import (
     SAPToolChatMessage,
     SAPUserMessage,
 )
-from .handler import (
-    GenAIHubOrchestrationError,
-    AsyncSAPStreamIterator,
-    SAPStreamIterator,
+
+_SAP_VENDOR_PREFIXES = (
+    "anthropic--",
+    "amazon--",
+    "cohere--",
+    "mistralai--",
+    "nvidia--",
+    "alephalpha--",
 )
+
+
+def _vendor(model: str) -> str:
+    for prefix in _SAP_VENDOR_PREFIXES:
+        if model.startswith(prefix):
+            return prefix[:-2]  # strip trailing "--"
+    return ""
+
+
+def _canonical_model_name(model: str) -> str:
+    prefix = _vendor(model)
+    return model[len(prefix) + 2 :] if prefix else model
+
+
+def _sap_supports_reasoning_effort(model: str) -> bool:
+    vendor = _vendor(model)
+    if vendor == "anthropic":
+        canonical = _canonical_model_name(model)
+        return canonical.startswith("claude-4") or canonical.startswith("claude-3-7")
+    if vendor:
+        return False
+    # no vendor prefix: Azure OpenAI models arrive bare; o-series support reasoning_effort
+    canonical = model
+    return len(canonical) > 1 and canonical[0] == "o" and canonical[1].isdigit()
+
+
+def _sap_supports_thinking(model: str) -> bool:
+    vendor = _vendor(model)
+    if vendor == "cohere":
+        return "reasoning" in _canonical_model_name(model)
+    return _sap_supports_reasoning_effort(model)
+
 
 # Keys routed outside SAP orchestration `model.params` (prompt, stream, fallbacks, etc.)
 _SAP_MODEL_PARAMS_EXCLUDED_KEYS: FrozenSet[str] = frozenset(
@@ -79,7 +120,9 @@ def _messages_to_sap_template(messages: List[Dict[str, str]]) -> list:  # type: 
     return template
 
 
-def _tools_response_format_and_stream(optional_params: dict, model_params: dict) -> Tuple[dict, dict, dict]:
+def _tools_response_format_and_stream(
+    optional_params: dict, model_params: dict
+) -> Tuple[dict, dict, dict]:
     tools_ = optional_params.pop("tools", [])
     tools_ = [validate_dict(tool, ChatCompletionTool) for tool in tools_]
     tools: dict = {"tools": tools_} if tools_ else {}
@@ -120,6 +163,8 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
     tools: Optional[list] = None
     tool_choice: Optional[Union[str, dict]] = None  #
     model_version: str = "latest"
+    reasoning_effort: Optional[Union[str, dict]] = None
+    thinking: Optional[dict] = None
 
     def __init__(
         self,
@@ -147,7 +192,9 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
 
     def run_env_setup(self, service_key: Optional[str] = None) -> None:
         try:
-            self.token_creator, self._base_url, self._resource_group = get_token_creator(service_key)  # type: ignore
+            self.token_creator, self._base_url, self._resource_group = (
+                get_token_creator(service_key)
+            )  # type: ignore
         except ValueError as err:
             raise GenAIHubOrchestrationError(status_code=400, message=err.args[0])
 
@@ -180,7 +227,9 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
         # Keep a short, tight client lifecycle here to avoid fd leaks
         client = litellm.module_level_client
         # with httpx.Client(timeout=30) as client:
-        deployments = client.get(f"{self.base_url}/lm/deployments", headers=self.headers).json()
+        deployments = client.get(
+            f"{self.base_url}/lm/deployments", headers=self.headers
+        ).json()
         valid: List[Tuple[str, str]] = []
         for dep in deployments.get("resources", []):
             if dep.get("scenarioId") == "orchestration":
@@ -223,6 +272,10 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             "response_format",
             "timeout",
         ]
+        if _sap_supports_reasoning_effort(model):
+            params.append("reasoning_effort")
+        if _sap_supports_thinking(model):
+            params.append("thinking")
         # Remove response_format for providers that don't support it on SAP GenAI Hub
         if (
             model.startswith("amazon")
@@ -283,7 +336,9 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
         resp_type = response_format.get("type", None)
         if resp_type:
             if resp_type == "json_schema":
-                response_format = validate_dict(response_format, ResponseFormatJSONSchema)
+                response_format = validate_dict(
+                    response_format, ResponseFormatJSONSchema
+                )
             else:
                 response_format = validate_dict(response_format, ResponseFormat)
             response_format = {"response_format": response_format}
@@ -291,7 +346,9 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             response_format = {}
 
         placeholder_defaults = params.pop("placeholder_defaults", {})
-        placeholder_defaults = {"defaults": placeholder_defaults} if placeholder_defaults else {}
+        placeholder_defaults = (
+            {"defaults": placeholder_defaults} if placeholder_defaults else {}
+        )
 
         optional_modules = {}
         optional_modules_lst = ["grounding", "masking", "filtering", "translation"]
@@ -355,7 +412,9 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             modules_dict = dict(modules_dict)
             fallback_model = modules_dict.pop("model", None)
             if fallback_model is None:
-                raise ValueError("Each entry in `fallback_sap_modules` must include a 'model' key.")
+                raise ValueError(
+                    "Each entry in `fallback_sap_modules` must include a 'model' key."
+                )
             if fallback_model.startswith("sap/"):
                 fallback_model = fallback_model[4:]
             fallback_template = modules_dict.pop("messages", [])
