@@ -89,6 +89,11 @@ def _sap_supports_thinking(model: str) -> bool:
     return _sap_supports_reasoning_effort(model)
 
 
+def _sap_supports_cached_content(model: str) -> bool:
+    # Google Gemini models on SAP arrive as bare names: gemini-2.5-pro, gemini-2.5-flash, etc.
+    return model.startswith("gemini")
+
+
 # Keys routed outside SAP orchestration `model.params` (prompt, stream, fallbacks, etc.)
 _SAP_MODEL_PARAMS_EXCLUDED_KEYS: FrozenSet[str] = frozenset(
     {
@@ -165,6 +170,7 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
     model_version: str = "latest"
     reasoning_effort: Optional[Union[str, dict]] = None
     thinking: Optional[dict] = None
+    cached_content: Optional[str] = None
 
     def __init__(
         self,
@@ -276,6 +282,8 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             params.append("reasoning_effort")
         if _sap_supports_thinking(model):
             params.append("thinking")
+        if _sap_supports_cached_content(model):
+            params.append("cached_content")
         # Remove response_format for providers that don't support it on SAP GenAI Hub
         if (
             model.startswith("amazon")

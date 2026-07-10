@@ -95,6 +95,56 @@ class TestReasoningParamSupport:
         assert model_params["thinking"] == thinking
 
 
+class TestCachingParamSupport:
+    @pytest.fixture
+    def mock_config(self):
+        from litellm.llms.sap.chat.transformation import GenAIHubOrchestrationConfig
+
+        config = GenAIHubOrchestrationConfig()
+        config.token_creator = lambda: "Bearer TEST_TOKEN"
+        config._base_url = "https://api.test-sap.com"
+        config._resource_group = "test-group"
+        return config
+
+    def test_cached_content_included_for_gemini(self, mock_config):
+        params = mock_config.get_supported_openai_params("gemini-2.5-pro")
+        assert "cached_content" in params
+
+    def test_cached_content_included_for_gemini_flash(self, mock_config):
+        params = mock_config.get_supported_openai_params("gemini-2.5-flash")
+        assert "cached_content" in params
+
+    def test_cached_content_excluded_for_gpt_model(self, mock_config):
+        params = mock_config.get_supported_openai_params("gpt-4o")
+        assert "cached_content" not in params
+
+    def test_cached_content_excluded_for_anthropic(self, mock_config):
+        params = mock_config.get_supported_openai_params("anthropic--claude-4.5-sonnet")
+        assert "cached_content" not in params
+
+    def test_cached_content_excluded_for_amazon(self, mock_config):
+        params = mock_config.get_supported_openai_params("amazon--nova-pro")
+        assert "cached_content" not in params
+
+    def test_cached_content_excluded_for_cohere(self, mock_config):
+        params = mock_config.get_supported_openai_params("cohere--command-a-reasoning")
+        assert "cached_content" not in params
+
+    def test_cached_content_reaches_model_params(self, mock_config):
+        cache_id = "cachedContents/my-cache-123"
+        result = mock_config.transform_request(
+            model="gemini-2.5-pro",
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={"cached_content": cache_id},
+            litellm_params={},
+            headers={},
+        )
+        model_params = result["config"]["modules"]["prompt_templating"]["model"][
+            "params"
+        ]
+        assert model_params["cached_content"] == cache_id
+
+
 class TestSAPTransformationIntegration:
     """Integration tests for SAP transformation."""
 
