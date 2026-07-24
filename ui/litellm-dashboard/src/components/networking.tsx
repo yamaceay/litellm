@@ -179,7 +179,7 @@ export interface PromptSpec {
 export interface PromptTemplateBase {
   litellm_prompt_id: string;
   content: string;
-  metadata?: Record<string, any> | null;
+  metadata?: Record<string, unknown> | null;
 }
 
 interface PromptInfoResponse {
@@ -212,6 +212,7 @@ export interface Organization {
     object_permission_id: string;
     mcp_servers: string[];
     mcp_access_groups?: string[];
+    mcp_toolsets?: string[];
     vector_stores: string[];
   };
 }
@@ -372,7 +373,7 @@ export function getGlobalLitellmHeaderName(): string {
   return globalLitellmHeaderName;
 }
 
-const apiClient = createApiClient({
+export const apiClient = createApiClient({
   getBaseUrl: getProxyBaseUrl,
   getAuthHeaderName: getGlobalLitellmHeaderName,
   onError: handleError,
@@ -6227,6 +6228,7 @@ export const applyGuardrail = async (
   text: string,
   language?: string | null,
   entities?: string[] | null,
+  metadata?: Record<string, unknown> | null,
 ) => {
   try {
     const url = proxyBaseUrl ? `${proxyBaseUrl}/guardrails/apply_guardrail` : `/guardrails/apply_guardrail`;
@@ -6242,6 +6244,10 @@ export const applyGuardrail = async (
 
     if (entities && entities.length > 0) {
       requestBody.entities = entities;
+    }
+
+    if (metadata != null) {
+      requestBody.metadata = metadata;
     }
 
     const response = await fetch(url, {
@@ -6650,6 +6656,9 @@ export const testMCPToolsListRequest = async (
     };
     if (accessToken) {
       headers["x-litellm-api-key"] = accessToken;
+      if (globalLitellmHeaderName.toLowerCase() !== "authorization") {
+        headers[globalLitellmHeaderName] = `Bearer ${accessToken}`;
+      }
     }
     if (oauthAccessToken) {
       headers["Authorization"] = `Bearer ${oauthAccessToken}`;
@@ -6729,6 +6738,7 @@ interface RegisterMcpOAuthClientPayload {
   grant_types?: string[];
   response_types?: string[];
   token_endpoint_auth_method?: string;
+  redirect_uris?: string[];
 }
 
 export const registerMcpOAuthClient = async (
@@ -6844,7 +6854,11 @@ export const exchangeMcpOAuthToken = async ({
 
   const data = await response.json();
   if (!response.ok) {
-    const errorMessage = deriveErrorMessage(data) || data?.detail || "OAuth token exchange failed";
+    const oauthErrorMessage =
+      typeof data?.error === "string" && typeof data?.error_description === "string"
+        ? `${data.error}: ${data.error_description}`
+        : undefined;
+    const errorMessage = oauthErrorMessage || deriveErrorMessage(data) || data?.detail || "OAuth token exchange failed";
     throw new Error(errorMessage);
   }
   return data;
@@ -7568,6 +7582,38 @@ export const fetchToolsList = async (accessToken: string): Promise<ToolRow[]> =>
   const data = await response.json();
   return data.tools ?? [];
 };
+
+export interface ToolSpendEntry {
+  tool_name: string;
+  spend: number;
+  call_count: number;
+  total_tokens: number;
+}
+
+export interface ToolSpendDailyEntry {
+  date: string;
+  tool_name: string;
+  spend: number;
+  call_count: number;
+}
+
+export interface ToolSpendResponse {
+  by_tool: ToolSpendEntry[];
+  daily: ToolSpendDailyEntry[];
+  total_spend: number;
+  start_date: string | null;
+  end_date: string | null;
+}
+
+export const getToolSpend = async (
+  accessToken: string,
+  startDate?: string,
+  endDate?: string,
+): Promise<ToolSpendResponse> =>
+  apiClient.get<ToolSpendResponse>(`/v1/tool/spend`, {
+    accessToken,
+    query: { start_date: startDate, end_date: endDate },
+  });
 
 export interface ToolPolicyOverrideRow {
   override_id: string;
