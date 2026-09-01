@@ -2,6 +2,7 @@
 Translate from OpenAI's `/v1/chat/completions` to SAP Generative AI Hub's Orchestration Service`v2/completion`
 """
 
+import re
 from collections.abc import AsyncIterator, Iterator
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Final, Union
@@ -12,8 +13,6 @@ import litellm
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import ModelResponse
 
-from ...openai.chat.gpt_transformation import OpenAIGPTConfig
-
 if TYPE_CHECKING:
     import tiktoken
 
@@ -23,6 +22,7 @@ if TYPE_CHECKING:
 else:
     LiteLLMLoggingObj = Any
 
+from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ..credentials import get_token_creator
 from .handler import (
     AsyncSAPStreamIterator,
@@ -44,12 +44,21 @@ from .models import (
 _SAP_MODEL_PARAMS_EXCLUDED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "tools",
-        "tool_choice",
         "stream_options",
         "fallback_sap_modules",
         "placeholder_values",
         "model_version",
+        "timeout",
+        "max_retries",
     }
+)
+
+# ---------------------------------------------------------------------------
+# SAP capability registry
+# ---------------------------------------------------------------------------
+# Models that accept reasoning_effort / thinking parameters on SAP GenAI Hub.
+_REASONING_MODELS: re.Pattern[str] = re.compile(
+    r"^(?:anthropic--claude-(?:4(?:\.[5-9])?|3-7)|o\d|gpt-5(?:[.\-]|$)|cohere--\S*reasoning\S*)"
 )
 
 
@@ -106,6 +115,26 @@ def _fold_message_cache_control(message: dict) -> dict:  # mutable-ok: message d
     return {
         k: v for k, v in message.items() if k != "cache_control"
     }  # mutable-ok: dict comprehension filters one key; returned immediately
+
+
+def _build_model_details(
+    model_name: str,
+    model_version: str,
+    params: dict,  # mutable-ok: model params dict forwarded directly to wire payload
+    timeout: int | None,
+    max_retries: int | None,
+) -> dict:  # mutable-ok: wire serialization helper; dict is the required output shape for JSON encoding
+    """Build the model dict for the orchestration request, adding optional fields only when set."""
+    model_details: dict = {  # mutable-ok: ephemeral wire dict built in one shot before JSON encoding
+        "name": model_name,
+        "params": params,
+        "version": model_version,
+    }
+    if timeout is not None:
+        model_details["timeout"] = timeout
+    if max_retries is not None:
+        model_details["max_retries"] = max_retries
+    return model_details
 
 
 def _messages_to_sap_template(messages: list[dict[str, str]]) -> list:
@@ -232,13 +261,15 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             "temperature",
             "top_p",
             "tools",
-            "tool_choice",
             "function_call",
             "functions",
             "extra_headers",
             "parallel_tool_calls",
             "response_format",
             "timeout",
+            "max_retries",
+            "model_version",
+            "user",
         ]
         # Remove response_format for providers that don't support it on SAP GenAI Hub
         if (
@@ -248,8 +279,8 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             or model == "gpt-4"
         ):
             params.remove("response_format")
-        if model.startswith("gemini") or model.startswith("amazon"):
-            params.remove("tool_choice")
+        if self._sap_supports_reasoning(model):
+            params.extend(["reasoning_effort", "thinking"])
         return params
 
     def validate_environment(
@@ -291,6 +322,8 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
             params.pop("strict")
 
         model_version: Final = params.pop("model_version", "latest")
+        timeout = params.pop("timeout", None)
+        max_retries = params.pop("max_retries", None)
 
         tools_ = params.pop("tools", [])
         tools_ = [_validate_tool(tool) for tool in tools_]
@@ -324,11 +357,7 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
                     **tools,
                     **response_format,
                 },
-                "model": {
-                    "name": model_name,
-                    "params": params,
-                    "version": model_version,
-                },
+                "model": _build_model_details(model_name, model_version, params, timeout, max_retries),
             },
             **optional_modules,
         }
@@ -357,8 +386,6 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
                 stream_config["chunk_size"] = stream_options["chunk_size"]
             if "delimiters" in stream_options:
                 stream_config["delimiters"] = stream_options["delimiters"]
-
-        optional_params.pop("tool_choice", None)
 
         modules: Final = [
             self._build_prompt_module(
@@ -412,13 +439,16 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
         api_key: str | None = None,
         json_mode: bool | None = None,
     ) -> ModelResponse:
-        logging_obj.post_call(
-            input=messages,
-            api_key=api_key,
-            original_response=raw_response.text,
-            additional_args={"complete_input_dict": request_data},
-        )
-        response = ModelResponse.model_validate(raw_response.json()["final_result"])
+        final_result = raw_response.json()["final_result"]
+
+        # SAP's orchestration service returns Gemini thinking as a list of
+        # {"content": str, "signature": str} objects under reasoning_content.
+        # Normalize to litellm's standard fields before model_validate, which
+        # crashes on a list-shaped reasoning_content.
+        if model.startswith("gemini"):
+            self._normalize_gemini_reasoning(final_result)
+
+        response = ModelResponse.model_validate(final_result)
 
         # Strip markdown code blocks if JSON response_format was used with Anthropic models
         # SAP GenAI Hub with Anthropic models sometimes wraps JSON in ```json ... ```
@@ -430,6 +460,46 @@ class GenAIHubOrchestrationConfig(OpenAIGPTConfig):
                 response = self._strip_markdown_json(response)
 
         return response
+
+    @staticmethod
+    def _sap_supports_reasoning(model: str) -> bool:
+        """Return True if *model* accepts reasoning_effort / thinking on SAP GenAI Hub."""
+        return bool(_REASONING_MODELS.match(model))
+
+    @staticmethod
+    def _normalize_gemini_reasoning(final_result: dict) -> None:
+        """Normalize SAP Gemini reasoning_content from list to litellm's standard fields.
+
+        SAP's orchestration service returns Gemini thinking as a list of
+        {"content": str, "signature": str} objects under reasoning_content.
+        litellm uses two parallel fields for this:
+        - thinking_blocks: list of ChatCompletionThinkingBlock dicts, preserving
+          signature tokens that Gemini requires to replay thinking in multi-turn
+          requests and that the Responses API serializes for round-trip preservation.
+        - reasoning_content: plain str derived from the same blocks, exposed to
+          callers and used by streaming accumulators and the Responses API.
+        Both must be populated; populating only the string loses the signatures.
+        """
+        for choice in final_result.get("choices") or []:
+            msg = (choice.get("message") or {}) if isinstance(choice, dict) else {}
+            rc = msg.get("reasoning_content")
+            if not isinstance(rc, list):
+                continue
+            blocks: list[dict] = []
+            texts: list[str] = []
+            for item in rc:
+                if not isinstance(item, dict):
+                    continue
+                thought = item.get("content", "")
+                block: dict = {"type": "thinking", "thinking": thought}
+                if item.get("signature") is not None:
+                    block["signature"] = item["signature"]  # mutable-ok: block is a local dict
+                blocks.append(block)
+                texts.append(thought)
+            msg["thinking_blocks"] = (
+                blocks if blocks else None
+            )  # rebind-ok: normalizing SAP Gemini list to ChatCompletionThinkingBlock list
+            msg["reasoning_content"] = "\n\n".join(texts) or None  # rebind-ok: normalizing SAP Gemini list to plain str
 
     def _strip_markdown_json(self, response: ModelResponse) -> ModelResponse:
         """Strip markdown code block wrapper from JSON content if present.
