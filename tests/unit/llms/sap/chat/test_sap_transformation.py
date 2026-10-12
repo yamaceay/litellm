@@ -1,5 +1,6 @@
 import warnings
 import pytest
+import litellm
 from pydantic import ValidationError
 
 
@@ -923,3 +924,58 @@ class TestCacheControl:
         content = self._template(body)[0]["content"]
         assert "cache_control" not in content[0]
         assert content[1].get("cache_control") == {"type": "ephemeral"}
+
+
+class TestImageInNonUserMessages:
+    """Image content in tool-result and assistant messages must raise BadRequestError, not ValidationError."""
+
+    @pytest.fixture
+    def mock_config(self):
+        from litellm.llms.sap.chat.transformation import GenAIHubOrchestrationConfig
+
+        config = GenAIHubOrchestrationConfig()
+        config.token_creator = lambda: "Bearer TEST_TOKEN"
+        config._base_url = "https://api.test-sap.com"
+        config._resource_group = "test-group"
+        return config
+
+    def _transform(self, config, messages):
+        return config.transform_request(
+            "anthropic--claude-4.5-sonnet", messages, {}, {}, {}
+        )
+
+    def test_image_in_tool_result_raises_bad_request(self, mock_config):
+        messages = [
+            {"role": "user", "content": "Take a screenshot."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "toolu_1", "type": "function", "function": {"name": "screenshot", "arguments": "{}"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_1",
+                "content": [
+                    {"type": "text", "text": "screenshot taken"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc="}},
+                ],
+            },
+        ]
+        with pytest.raises(litellm.BadRequestError):
+            self._transform(mock_config, messages)
+
+    def test_image_in_assistant_message_raises_bad_request(self, mock_config):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Here is what I found:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc="}},
+                ],
+            },
+            {"role": "user", "content": "What does it show?"},
+        ]
+        with pytest.raises(litellm.BadRequestError):
+            self._transform(mock_config, messages)

@@ -7,6 +7,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Any, Final, Union
 
 import httpx
+from pydantic import ValidationError
 
 import litellm
 from litellm.types.llms.openai import AllMessageValues
@@ -103,7 +104,14 @@ def _messages_to_sap_template(messages: list[AllMessageValues]) -> list:
     for message in messages:
         folded_message = _fold_message_cache_control(message)
         message_role_class = _message_role_mapping(str(folded_message["role"]))
-        validated_message = validate_dict(folded_message, message_role_class)
+        try:
+            validated_message = validate_dict(folded_message, message_role_class)
+        except ValidationError as e:
+            raise litellm.BadRequestError(
+                message=f"Invalid message content for role '{folded_message.get('role')}': {e}",
+                model="sap",
+                llm_provider="sap",
+            ) from e
         template.append(validated_message)
     return template
 
